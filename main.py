@@ -36,6 +36,13 @@ def log_transacao(tipo_transacao):
             data_hora = agora.strftime("%d/%m/%Y %H:%M:%S")
             print(f"\n[LOG] {data_hora} - Transação: {tipo_transacao}")
             resultado = funcao(*args, **kwargs)
+
+            with open("log_transacoes.txt", "a", encoding="utf-8") as arquivo_log:
+                arquivo_log.write(
+                    f"[{data_hora}] Função '{funcao.__name__}' executada com argumentos {args} e {kwargs}. "
+                    f"Retornou {resultado}\n"
+                )
+                
             return resultado
         return envoltorio
     return decorador
