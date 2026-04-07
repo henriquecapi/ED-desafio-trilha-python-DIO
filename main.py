@@ -1,7 +1,28 @@
+"""
+SISTEMA BANCÁRIO PYTHON v4.0 - COM PERSISTÊNCIA DE DADOS EM CSV
+Implementa carregamento e salvamento de dados em arquivos CSV
+"""
+
 import textwrap
 import re
 from datetime import datetime, date
 from functools import wraps
+from csv_manager import (
+    inicializar_csvs, 
+    adicionar_usuario_csv, 
+    carregar_usuarios,
+    usuario_existe,
+    obter_usuario,
+    adicionar_conta_csv,
+    carregar_contas,
+    obter_contas_do_usuario,
+    atualizar_saldo_conta,
+    adicionar_transacao_csv,
+    obter_transacoes_conta,
+    obter_saldo_conta,
+    dados_existem,
+    contas_existem
+)
 
 # ================== DECORADOR DE LOG ==================
 def log_transacao(tipo_transacao):
@@ -39,40 +60,26 @@ class ContaIterador:
         conta = self.contas[self._index]
         self._index += 1
         
-        # Calcular saldo da conta (contas podem ter transações)
-        saldo_conta = 0
-        if "transacoes" in conta:
-            for transacao in conta["transacoes"]:
-                if transacao["tipo"] == "deposito":
-                    saldo_conta += transacao["valor"]
-                elif transacao["tipo"] == "saque":
-                    saldo_conta -= transacao["valor"]
+        # Calcular saldo da conta
+        saldo_conta = obter_saldo_conta(conta['cpf'], conta['numero_conta'])
         
         return {
-            "agencia": conta["agencia"],
-            "numero": conta["numero_conta"],
-            "titular": conta["usuario"]["nome"],
+            "agencia": conta['agencia'],
+            "numero": conta['numero_conta'],
+            "titular": obter_usuario(conta['cpf'])['nome'],
             "saldo": saldo_conta
         }
 
 # ================== GERADOR DE RELATÓRIOS ==================
-def gerar_relatorio_transacoes(conta, tipo_filtro=None):
+def gerar_relatorio_transacoes(cpf, numero_conta, tipo_filtro=None):
     """
     Gerador que permite iterar sobre as transações de uma conta.
     Retorna uma a uma as transações realizadas.
-    
-    Args:
-        conta: Dicionário da conta
-        tipo_filtro: Opcional - pode ser "deposito", "saque" ou None (todos)
-    
-    Yields:
-        Transação formatada
     """
-    if "transacoes" not in conta or not conta["transacoes"]:
-        return
+    transacoes = obter_transacoes_conta(cpf, numero_conta)
     
-    for transacao in conta["transacoes"]:
-        if tipo_filtro is None or transacao["tipo"] == tipo_filtro:
+    for transacao in transacoes:
+        if tipo_filtro is None or transacao['tipo'] == tipo_filtro:
             yield transacao
 
 # ================== VALIDAÇÕES ==================
@@ -81,18 +88,14 @@ def validar_cpf(cpf):
     Valida um CPF seguindo as regras brasileiras.
     Verifica se o CPF possui 11 dígitos e valida os dígitos verificadores.
     """
-    # Remove caracteres que não sejam dígitos
     cpf = re.sub(r'\D', '', cpf)
     
-    # CPF deve ter exatamente 11 dígitos
     if len(cpf) != 11:
         return False
     
-    # Não pode ser todos os mesmos dígitos
     if cpf == cpf[0] * 11:
         return False
     
-    # Validar primeiro dígito verificador
     soma = sum(int(cpf[i]) * (10 - i) for i in range(9))
     resto = soma % 11
     primeiro_digito = 0 if resto < 2 else 11 - resto
@@ -100,7 +103,6 @@ def validar_cpf(cpf):
     if int(cpf[9]) != primeiro_digito:
         return False
     
-    # Validar segundo dígito verificador
     soma = sum(int(cpf[i]) * (11 - i) for i in range(10))
     resto = soma % 11
     segundo_digito = 0 if resto < 2 else 11 - resto
@@ -114,23 +116,16 @@ def normalizar_endereco(endereco):
     """
     Normaliza e valida o endereço, aceitando CEP com ou sem ponto.
     Retorna o endereço normalizado com CEP sem ponto.
-    
-    Formato esperado: logradouro, numero - bairro - cidade/uf - CEP
-    Exemplo: Rua Manoel Almino de Lima, 600 - Novo Crato - Crato/CE - 63.113-420
     """
     if not endereco or not isinstance(endereco, str):
         return None
     
     endereco = endereco.strip()
-    
-    # Dividir o endereço em partes usando " - " como separador
     partes = [p.strip() for p in endereco.split(" - ")]
     
-    # Deve ter 3 partes: (logradouro,numero), (bairro), (cidade/uf + CEP)
     if len(partes) < 3:
         return None
     
-    # Primeira parte: logradouro e número
     parte1 = partes[0]
     if ',' not in parte1:
         return None
@@ -138,27 +133,22 @@ def normalizar_endereco(endereco):
     logradouro = logradouro_numero[0].strip()
     numero = logradouro_numero[1].strip()
     
-    # Validar se número contém apenas dígitos
     if not numero.isdigit():
         return None
     
-    # Segunda parte: bairro
     bairro = partes[1].strip()
     if not bairro:
         return None
     
-    # Última parte: cidade/uf - CEP
-    ultima_parte = " - ".join(partes[2:])  # Caso tenha mais de 3 partes
+    ultima_parte = " - ".join(partes[2:])
     
-    # Dividir na última ocorrência de " - "
     if " - " not in ultima_parte:
         return None
     
-    partes_cep = ultima_parte.rsplit(" - ", 1)  # Split da direita para esquerda
+    partes_cep = ultima_parte.rsplit(" - ", 1)
     cidade_uf = partes_cep[0].strip()
     cep_str = partes_cep[1].strip()
     
-    # Validar cidade/uf (formato: CIDADE/UF)
     if '/' not in cidade_uf:
         return None
     
@@ -166,38 +156,40 @@ def normalizar_endereco(endereco):
     cidade = cidade_uf_partes[0].strip()
     uf = cidade_uf_partes[1].strip()
     
-    # Validar UF (deve ter 2 letras maiúsculas)
     if len(uf) != 2 or not uf.isupper():
-        # Tenta converter para maiúsculas
         uf = uf.upper()
         if len(uf) != 2 or not uf.isalpha():
             return None
     
-    # Validar e extrair CEP
-    # CEP pode estar em formato 12345-678 ou 12.345-678
-    cep_limpo = re.sub(r'[^0-9\-]', '', cep_str)  # Remove tudo que não é dígito ou hífen
+    cep_limpo = re.sub(r'[^0-9\-]', '', cep_str)
     
-    # Padrão: 5 dígitos, hífen, 3 dígitos
     if not re.match(r'^\d{5}-\d{3}$', cep_limpo):
         return None
     
-    # Reconstruir endereço normalizado
     endereco_normalizado = f"{logradouro}, {numero} - {bairro} - {cidade}/{uf} - {cep_limpo}"
     
     return endereco_normalizado
 
 def validar_endereco(endereco):
-    """
-    Valida o endereço no formato especificado:
-    logradouro, numero - bairro - cidade/uf - CEP
-    Aceita CEP com ou sem ponto (ex: 01234-567 ou 01.234-567)
-    """
+    """Valida o endereço no formato especificado."""
     return normalizar_endereco(endereco) is not None
 
-def menu():
-    """Exibe o menu e retorna a opção selecionada."""
+# ================== MENUS ==================
+def menu_primeira_execucao():
+    """Menu para primeira execução (sem usuários/contas)."""
+    menu_text = """\n
+    ================ MENU (Primeira Execução) ================
+    [nu]     Novo usuário
+    [nc]     Nova conta (após criar usuário)
+    [qt]     Sair
+    => """
+    return input(textwrap.dedent(menu_text))
+
+def menu_dados_existentes():
+    """Menu após dados existirem (login disponível)."""
     menu_text = """\n
     ================ MENU ================
+    [lg]     Login na conta
     [de]     Depositar
     [sa]     Sacar
     [ex]     Extrato
@@ -211,131 +203,24 @@ def menu():
     => """
     return input(textwrap.dedent(menu_text))
 
-@log_transacao("DEPÓSITO")
-def depositar(saldo, valor, extrato, transacoes, /):
-    """
-    Realiza um depósito na conta.
-    Registra a transação com data e hora.
-    """
-    if valor <= 0:
-        print("\n@@@ Operação falhou! O valor informado é inválido. @@@")
-        return saldo, extrato, transacoes
-    
-    saldo += valor
-    agora = datetime.now()
-    data_hora = agora.strftime("%d/%m/%Y %H:%M:%S")
-    
-    extrato += f"[{data_hora}] Depósito:\t\tR$ {valor:.2f}\n"
-    
-    # Registrar transação
-    transacao = {
-        "tipo": "deposito",
-        "valor": valor,
-        "data_hora": agora,
-        "data_hora_str": data_hora,
-        "saldo_apos": saldo
-    }
-    transacoes.append(transacao)
-    
-    print("\n=== Depósito realizado com sucesso! ===")
-    return saldo, extrato, transacoes
-
-@log_transacao("SAQUE")
-def sacar(*, saldo, valor, extrato, limite, numero_saques, limite_saques, transacoes, transacoes_hoje):
-    """
-    Realiza um saque na conta.
-    Verifica limite de 10 transações diárias.
-    Registra a transação com data e hora.
-    """
-    excedeu_saldo = valor > saldo
-    excedeu_limite = valor > limite
-    excedeu_saques = numero_saques >= limite_saques
-    excedeu_transacoes_dia = transacoes_hoje >= 10  # Novo: limite de 10 transações diárias
-    
-    if excedeu_saldo:
-        print("\n@@@ Operação falhou! Você não tem saldo suficiente. @@@")
-    elif excedeu_limite:
-        print("\n@@@ Operação falhou! O valor do saque excede o limite. @@@")
-    elif excedeu_saques:
-        print("\n@@@ Operação falhou! Número máximo de saques excedido. @@@")
-    elif excedeu_transacoes_dia:
-        print("\n@@@ Operação falhou! Você excedeu o número de transações permitidas para hoje (máximo 10). @@@")
-    elif valor <= 0:
-        print("\n@@@ Operação falhou! O valor informado é inválido. @@@")
-    else:
-        saldo -= valor
-        agora = datetime.now()
-        data_hora = agora.strftime("%d/%m/%Y %H:%M:%S")
-        
-        extrato += f"[{data_hora}] Saque:\t\t\tR$ {valor:.2f}\n"
-        numero_saques += 1
-        
-        # Registrar transação
-        transacao = {
-            "tipo": "saque",
-            "valor": valor,
-            "data_hora": agora,
-            "data_hora_str": data_hora,
-            "saldo_apos": saldo
-        }
-        transacoes.append(transacao)
-        
-        print("\n=== Saque realizado com sucesso! ===")
-        return saldo, extrato, numero_saques, transacoes, transacoes_hoje + 1
-    
-    return saldo, extrato, numero_saques, transacoes, transacoes_hoje
-
-def exibir_extrato(saldo, /, *, extrato, transacoes=None):
-    """
-    Exibe o extrato da conta com todas as transações.
-    Se transações forem fornecidas, exibe com data/hora detalhada.
-    """
-    print("\n================ EXTRATO ================")
-    
-    if transacoes and len(transacoes) > 0:
-        print("\nHistórico detalhado de transações:\n")
-        for i, transacao in enumerate(transacoes, 1):
-            tipo = transacao["tipo"].upper()
-            valor = transacao["valor"]
-            data_hora = transacao["data_hora_str"]
-            saldo_apos = transacao["saldo_apos"]
-            
-            if transacao["tipo"] == "deposito":
-                print(f"{i}. [{data_hora}] DEPÓSITO")
-                print(f"   Valor: R$ {valor:.2f}")
-                print(f"   Saldo após transação: R$ {saldo_apos:.2f}\n")
-            else:
-                print(f"{i}. [{data_hora}] SAQUE")
-                print(f"   Valor: R$ {valor:.2f}")
-                print(f"   Saldo após transação: R$ {saldo_apos:.2f}\n")
-    elif extrato:
-        print(extrato)
-    else:
-        print("Nenhuma transação realizada.")
-    
-    print(f"\nSaldo:\t\t\tR$ {saldo:.2f}")
-    print("==========================================")
-
-def novo_usuario(usuarios):
+# ================== OPERAÇÕES COM USUÁRIOS ==================
+def novo_usuario():
     """Cria um novo usuário com validação de CPF e endereço."""
     cpf = input("Informe o CPF (somente números): ")
     cpf = re.sub(r'\D', '', cpf)
     
-    # Validar CPF
     if not validar_cpf(cpf):
         print("\n@@@ CPF inválido! @@@")
-        return
+        return False
     
-    # Verificar se CPF já existe
-    if filtrar_usuario(cpf, usuarios):
+    if usuario_existe(cpf):
         print("\n@@@ Já existe usuário com esse CPF! @@@")
-        return
+        return False
     
     nome = input("Informe o nome completo: ")
     data_nascimento = input("Informe a data de nascimento (dd/mm/yyyy): ")
     endereco = input("Informe o endereço (logradouro, numero - bairro - cidade/uf - CEP): ")
     
-    # Validar e normalizar endereço
     endereco_normalizado = normalizar_endereco(endereco)
     if not endereco_normalizado:
         print("\n@@@ Endereço em formato inválido! @@@")
@@ -347,41 +232,35 @@ def novo_usuario(usuarios):
         print("  ✓ Bairro")
         print("  ✓ Cidade/UF (2 letras maiúsculas)")
         print("  ✓ CEP no formato XXXXX-XXX ou XXXXX.XXX")
-        return
+        return False
     
-    usuario = {
-        "nome": nome,
-        "data_nascimento": data_nascimento,
-        "cpf": cpf,
-        "endereco": endereco_normalizado
-    }
-    
-    usuarios.append(usuario)
-    print("\n=== Usuário criado com sucesso! ===")
-    print(f"Nome: {nome}")
-    print(f"CPF: {cpf}")
+    if adicionar_usuario_csv(cpf, nome, data_nascimento, endereco_normalizado):
+        print("\n=== Usuário criado com sucesso! ===")
+        print(f"Nome: {nome}")
+        print(f"CPF: {cpf}")
+        return True
+    else:
+        print("\n@@@ Erro ao salvar usuário! @@@")
+        return False
 
-def filtrar_usuario(cpf, usuarios):
-    """Filtra um usuário pelo CPF na lista de usuários."""
-    usuarios_filtrados = [usuario for usuario in usuarios if usuario["cpf"] == cpf]
-    return usuarios_filtrados[0] if usuarios_filtrados else None
-
-def nova_conta(agencia, numero_conta, usuarios):
+# ================== OPERAÇÕES COM CONTAS ==================
+def nova_conta(agencia):
     """Cria uma nova conta vinculada a um usuário existente."""
+    usuarios = carregar_usuarios()
+    
     if not usuarios:
         print("\n@@@ Nenhum usuário cadastrado! Crie um usuário antes de criar uma conta. @@@")
         return None
     
     cpf = input("Informe o CPF do usuário: ")
-    # Limpar CPF: remover espaços, pontos, hífens e outros caracteres não numéricos
-    cpf = re.sub(r'\s+', '', cpf)  # Remove espaços em branco
-    cpf = re.sub(r'\D', '', cpf)   # Remove todos os caracteres que não são dígitos
+    cpf = re.sub(r'\s+', '', cpf)
+    cpf = re.sub(r'\D', '', cpf)
     
     if not cpf or len(cpf) != 11:
         print("\n@@@ CPF inválido! Deve conter 11 dígitos. @@@")
         return None
     
-    usuario = filtrar_usuario(cpf, usuarios)
+    usuario = obter_usuario(cpf)
     
     if not usuario:
         print(f"\n@@@ Usuário com CPF {cpf} não encontrado! @@@")
@@ -390,31 +269,148 @@ def nova_conta(agencia, numero_conta, usuarios):
             print(f"  - {u['nome']} (CPF: {u['cpf']})")
         return None
     
-    conta = {
-        "agencia": agencia,
-        "numero_conta": numero_conta,
-        "usuario": usuario,
-        "transacoes": [],  # Novo: lista para armazenar transações com data/hora
-        "data_criacao": datetime.now()  # Novo: data de criação da conta
-    }
+    # Descobrir próximo número de conta
+    contas = carregar_contas()
+    numero_conta = len(contas) + 1
+    data_criacao = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     
-    print("\n=== Conta criada com sucesso! ===")
-    print(f"Titular: {usuario['nome']}")
-    print(f"Agência: {agencia}")
-    print(f"Número da Conta: {numero_conta}")
-    return conta
+    if adicionar_conta_csv(cpf, agencia, numero_conta, data_criacao, saldo=0):
+        print("\n=== Conta criada com sucesso! ===")
+        print(f"Titular: {usuario['nome']}")
+        print(f"Agência: {agencia}")
+        print(f"Número da Conta: {numero_conta}")
+        
+        # Retornar estrutura completa igual a login_conta()
+        conta_criada = {
+            'cpf': cpf,
+            'agencia': agencia,
+            'numero_conta': numero_conta,
+            'data_criacao': data_criacao,
+            'saldo': 0
+        }
+        
+        return {
+            'cpf': cpf,
+            'usuario': usuario,
+            'conta': conta_criada,
+            'numero_conta': numero_conta
+        }
+    else:
+        print("\n@@@ Erro ao salvar conta! @@@")
+        return None
 
-def exibir_relatorio(conta):
+# ================== OPERAÇÕES BANCÁRIAS ==================
+@log_transacao("DEPÓSITO")
+def depositar(cpf, numero_conta, valor):
+    """Realiza um depósito na conta."""
+    if valor <= 0:
+        print("\n@@@ Operação falhou! O valor informado é inválido. @@@")
+        return False
+    
+    # Obter saldo atual
+    saldo = obter_saldo_conta(cpf, numero_conta)
+    novo_saldo = saldo + valor
+    
+    # Adicionar transação
+    agora = datetime.now()
+    data_hora = agora.strftime("%d/%m/%Y %H:%M:%S")
+    
+    if adicionar_transacao_csv(cpf, numero_conta, "deposito", valor, data_hora, novo_saldo):
+        print("\n=== Depósito realizado com sucesso! ===")
+        print(f"Valor: R$ {valor:.2f}")
+        print(f"Saldo anterior: R$ {saldo:.2f}")
+        print(f"Saldo atual: R$ {novo_saldo:.2f}")
+        return True
+    else:
+        print("\n@@@ Erro ao processar depósito! @@@")
+        return False
+
+@log_transacao("SAQUE")
+def sacar(cpf, numero_conta, valor, limite=500, limite_saques=3):
+    """Realiza um saque na conta com verificações de limite."""
+    saldo = obter_saldo_conta(cpf, numero_conta)
+    
+    # Contar saques de hoje
+    transacoes = obter_transacoes_conta(cpf, numero_conta)
+    data_hoje = date.today().strftime("%d/%m/%Y")
+    saques_hoje = sum(1 for t in transacoes if t['tipo'] == 'saque' and t['data_hora'].startswith(data_hoje))
+    
+    # Contar transações de hoje
+    transacoes_hoje = sum(1 for t in transacoes if t['data_hora'].startswith(data_hoje))
+    
+    excedeu_saldo = valor > saldo
+    excedeu_limite = valor > limite
+    excedeu_saques = saques_hoje >= limite_saques
+    excedeu_transacoes_dia = transacoes_hoje >= 10
+    
+    if excedeu_saldo:
+        print("\n@@@ Operação falhou! Você não tem saldo suficiente. @@@")
+    elif excedeu_limite:
+        print("\n@@@ Operação falhou! O valor do saque excede o limite. @@@")
+    elif excedeu_saques:
+        print(f"\n@@@ Operação falhou! Número máximo de saques ({limite_saques}) excedido. @@@")
+    elif excedeu_transacoes_dia:
+        print("\n@@@ Operação falhou! Você excedeu o número de transações permitidas para hoje (máximo 10). @@@")
+    elif valor <= 0:
+        print("\n@@@ Operação falhou! O valor informado é inválido. @@@")
+    else:
+        novo_saldo = saldo - valor
+        agora = datetime.now()
+        data_hora = agora.strftime("%d/%m/%Y %H:%M:%S")
+        
+        if adicionar_transacao_csv(cpf, numero_conta, "saque", valor, data_hora, novo_saldo):
+            print("\n=== Saque realizado com sucesso! ===")
+            print(f"Valor: R$ {valor:.2f}")
+            print(f"Saldo anterior: R$ {saldo:.2f}")
+            print(f"Saldo atual: R$ {novo_saldo:.2f}")
+            return True
+        else:
+            print("\n@@@ Erro ao processar saque! @@@")
+            return False
+    
+    return False
+
+# ================== VISUALIZAÇÕES ==================
+def exibir_extrato(cpf, numero_conta):
+    """Exibe o extrato da conta com todas as transações."""
+    transacoes = obter_transacoes_conta(cpf, numero_conta)
+    saldo = obter_saldo_conta(cpf, numero_conta)
+    
+    print("\n================ EXTRATO ================")
+    
+    if transacoes:
+        print("\nHistórico detalhado de transações:\n")
+        for i, transacao in enumerate(transacoes, 1):
+            tipo = transacao['tipo'].upper()
+            valor = transacao['valor']
+            data_hora = transacao['data_hora']
+            saldo_apos = transacao['saldo_apos']
+            
+            if transacao['tipo'] == 'deposito':
+                print(f"{i}. [{data_hora}] DEPÓSITO")
+            else:
+                print(f"{i}. [{data_hora}] SAQUE")
+            print(f"   Valor: R$ {valor:.2f}")
+            print(f"   Saldo após transação: R$ {saldo_apos:.2f}\n")
+    else:
+        print("Nenhuma transação realizada.")
+    
+    print(f"\nSaldo Atual:\t\tR$ {saldo:.2f}")
+    print("==========================================")
+
+def exibir_relatorio(cpf, numero_conta):
     """
     Exibe relatório de transações usando o gerador.
     Permite ao usuário escolher se quer filtrar por tipo.
     """
-    if not conta or "transacoes" not in conta or not conta["transacoes"]:
+    transacoes = obter_transacoes_conta(cpf, numero_conta)
+    
+    if not transacoes:
         print("\n@@@ Nenhuma transação registrada nesta conta! @@@")
         return
     
     print("\n================ RELATÓRIO DE TRANSAÇÕES ================")
-    print(f"Conta: {conta['numero_conta']} | Titular: {conta['usuario']['nome']}")
+    print(f"Conta: {numero_conta} | CPF: {cpf}")
     print("\n[1] Todas as transações")
     print("[2] Apenas depósitos")
     print("[3] Apenas saques")
@@ -432,11 +428,11 @@ def exibir_relatorio(conta):
         print("\n--- TODAS AS TRANSAÇÕES ---\n")
     
     encontrou = False
-    for i, transacao in enumerate(gerar_relatorio_transacoes(conta, filtro), 1):
+    for i, transacao in enumerate(gerar_relatorio_transacoes(cpf, numero_conta, filtro), 1):
         encontrou = True
         tipo = transacao["tipo"].upper()
         valor = transacao["valor"]
-        data_hora = transacao["data_hora_str"]
+        data_hora = transacao["data_hora"]
         saldo_apos = transacao["saldo_apos"]
         
         print(f"{i}. [{data_hora}] {tipo}")
@@ -448,21 +444,31 @@ def exibir_relatorio(conta):
     
     print("=" * 55)
 
-def listar_contas(contas):
+def listar_contas():
     """Lista todas as contas criadas com informações do titular."""
+    contas = carregar_contas()
+    
     if not contas:
         print("\n@@@ Nenhuma conta cadastrada! @@@")
         return
     
     print("\n================ CONTAS ================")
     for conta in contas:
+        usuario = obter_usuario(conta['cpf'])
+        saldo = obter_saldo_conta(conta['cpf'], conta['numero_conta'])
+        
         print(f"\nAgência: {conta['agencia']}")
         print(f"Número da Conta: {conta['numero_conta']}")
-        print(f"Titular: {conta['usuario']['nome']}")
+        print(f"Titular: {usuario['nome']}")
+        print(f"Saldo: R$ {saldo:.2f}")
         print("-" * 40)
     print("==========================================")
-def listar_usuarios_com_contas(usuarios, contas):
+
+def listar_usuarios_com_contas():
     """Lista todos os usuários com suas contas relacionadas."""
+    usuarios = carregar_usuarios()
+    contas = carregar_contas()
+    
     if not usuarios:
         print("\n@@@ Nenhum usuário cadastrado! @@@")
         return
@@ -475,24 +481,23 @@ def listar_usuarios_com_contas(usuarios, contas):
         print(f"Data de Nascimento: {usuario['data_nascimento']}")
         print(f"Endereço: {usuario['endereco']}")
         
-        # Filtrar contas deste usuário
-        contas_usuario = [conta for conta in contas if conta['usuario']['cpf'] == usuario['cpf']]
+        contas_usuario = [c for c in contas if c['cpf'] == usuario['cpf']]
         
         if contas_usuario:
             print(f"\n  Contas ({len(contas_usuario)}):")
             for conta in contas_usuario:
-                print(f"    - Agência: {conta['agencia']} | Conta: {conta['numero_conta']}")
+                saldo = obter_saldo_conta(conta['cpf'], conta['numero_conta'])
+                print(f"    - Agência: {conta['agencia']} | Conta: {conta['numero_conta']} | Saldo: R$ {saldo:.2f}")
         else:
             print(f"\n  Contas: Nenhuma conta cadastrada")
         
         print("-" * 50)
     print("===================================================")
 
-def exibir_iterador_contas(contas):
-    """
-    Usa o iterador personalizado ContaIterador para exibir as contas.
-    Mostra número, saldo (calculado), agência e titular.
-    """
+def exibir_iterador_contas():
+    """Usa o iterador personalizado ContaIterador para exibir as contas."""
+    contas = carregar_contas()
+    
     if not contas:
         print("\n@@@ Nenhuma conta cadastrada! @@@")
         return
@@ -510,103 +515,166 @@ def exibir_iterador_contas(contas):
     
     print("=" * 60)
 
-def main():
-    """Função principal que executa o loop do programa."""
-    LIMITE_SAQUES = 3
-    AGENCIA = "0001"
+def login_conta():
+    """
+    Realiza login por conta.
+    Pede CPF, valida usuário, lista suas contas e permite selecionar uma.
+    """
+    cpf = input("Informe o CPF: ")
+    cpf = re.sub(r'\s+', '', cpf)
+    cpf = re.sub(r'\D', '', cpf)
     
-    saldo = 0
-    limite = 500
-    extrato = ""
-    numero_saques = 0
-    usuarios = []
-    contas = []
-    transacoes = []  # Novo: lista global de transações da conta ativa
-    transacoes_hoje = 0  # Novo: contador de transações do dia
-    data_transacoes = date.today()  # Novo: data das transações para resetar contador
-    conta_ativa = None  # Novo: rastrear qual conta está ativa
+    if not cpf or len(cpf) != 11:
+        print("\n@@@ CPF inválido! Deve conter 11 dígitos. @@@")
+        return None
     
-    print("\n" + "="*50)
-    print("BEM-VINDO AO SISTEMA BANCÁRIO PYTHON v3.0")
-    print("Com suporte a Data/Hora, Decoradores, Geradores e Iteradores")
-    print("="*50)
+    usuario = obter_usuario(cpf)
+    if not usuario:
+        print(f"\n@@@ Usuário com CPF {cpf} não encontrado! @@@")
+        return None
+    
+    contas_usuario = obter_contas_do_usuario(cpf)
+    
+    if not contas_usuario:
+        print(f"\n@@@ O usuário {usuario['nome']} não possui contas! @@@")
+        return None
+    
+    print(f"\n=== Bem-vindo, {usuario['nome']}! ===")
+    print("\nSuas contas:")
+    
+    for i, conta in enumerate(contas_usuario, 1):
+        saldo = obter_saldo_conta(conta['cpf'], conta['numero_conta'])
+        print(f"{i}. Agência: {conta['agencia']} | Conta: {conta['numero_conta']} | Saldo: R$ {saldo:.2f}")
     
     while True:
-        opcao = menu()
+        try:
+            numero_conta_digitado = int(input("\nSelecione o número da conta para acessar: "))
+            # Validar se o número da conta digitado existe entre as contas do usuário
+            conta_selecionada = None
+            for conta in contas_usuario:
+                # Converter numero_conta para int para comparação (pode vir como string do CSV)
+                if int(conta['numero_conta']) == numero_conta_digitado:
+                    conta_selecionada = conta
+                    break
+            
+            if conta_selecionada:
+                return {
+                    'cpf': cpf,
+                    'usuario': usuario,
+                    'conta': conta_selecionada,
+                    'numero_conta': conta_selecionada['numero_conta']
+                }
+            else:
+                print("@@@ Número de conta inválido! Selecione um dos números listados acima. @@@")
+        except ValueError:
+            print("Digite um número válido!")
+
+# ================== EXIBIÇÃO DA CONTA ATIVA ==================
+def exibir_conta_ativa(conta_ativa):
+    """
+    Exibe as informações da conta ativa com data/hora.
+    Chamada antes do menu sempre que há conta logada.
+    """
+    if not conta_ativa:
+        return
+    
+    agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    usuario_nome = conta_ativa['usuario']['nome'] if isinstance(conta_ativa.get('usuario'), dict) else "Desconhecido"
+    numero_conta = conta_ativa.get('numero_conta', '')
+    
+    print(f"\n[{agora}] {usuario_nome} - Conta: {numero_conta}")
+
+# ================== FUNÇÃO PRINCIPAL ==================
+def main():
+    """Função principal que executa o loop do programa."""
+    AGENCIA = "0001"
+    LIMITE = 500
+    LIMITE_SAQUES = 3
+    
+    # Inicializar CSVs
+    inicializar_csvs()
+    
+    print("\n" + "="*50)
+    print("BEM-VINDO AO SISTEMA BANCÁRIO PYTHON v4.0")
+    print("Com Persistência de Dados em CSV")
+    print("="*50)
+    
+    conta_ativa = None  # Rastrear conta ativa do usuário
+    
+    while True:
+        # Exibir informações da conta ativa se houver
+        exibir_conta_ativa(conta_ativa)
         
-        # Verificar se precisa resetar contador de transações (novo dia)
-        if transacoes_hoje > 0 and date.today() != data_transacoes:
-            data_transacoes = date.today()
-            transacoes_hoje = 0
-            numero_saques = 0
-            print("\n[INFO] Novo dia! Contadores de transações e saques resetados.")
+        # Verificar se é primeira execução ou se já há dados
+        if not dados_existem():
+            opcao = menu_primeira_execucao()
+        else:
+            opcao = menu_dados_existentes()
         
         if opcao == "nu":
-            novo_usuario(usuarios)
+            novo_usuario()
         
         elif opcao == "nc":
-            numero_conta = len(contas) + 1
-            conta = nova_conta(AGENCIA, numero_conta, usuarios)
+            conta = nova_conta(AGENCIA)
             if conta:
-                contas.append(conta)
-                conta_ativa = conta  # Novo: define a conta ativa
-                transacoes = conta["transacoes"]
-                saldo = 0  # Reset de saldo para a nova conta
-                numero_saques = 0
-                transacoes_hoje = 0
+                conta_ativa = conta
+                usuario = obter_usuario(conta['cpf'])
+                print(f"\n✓ Conta criada com sucesso e definida como ativa!")
+        
+        elif opcao == "lg":
+            if not contas_existem():
+                print("\n@@@ Nenhuma conta cadastrada! Crie uma conta primeiro. @@@")
+                continue
+            
+            login = login_conta()
+            if login:
+                conta_ativa = login
+                print("\n✓ Login realizado com sucesso!")
         
         elif opcao == "de":
             if not conta_ativa:
-                print("\n@@@ Nenhuma conta ativa! Crie uma nova conta primeiro. @@@")
+                print("\n@@@ Nenhuma conta ativa! Faça login em uma conta primeiro. @@@")
                 continue
             
             try:
                 valor = float(input("Informe o valor do depósito: R$ "))
-                saldo, extrato, transacoes = depositar(saldo, valor, extrato, transacoes)
-                conta_ativa["transacoes"] = transacoes  # Atualizar transações da conta
-                transacoes_hoje += 1
+                depositar(conta_ativa['cpf'], conta_ativa['numero_conta'], valor)
             except ValueError:
                 print("\n@@@ Valor inválido! @@@")
         
         elif opcao == "sa":
             if not conta_ativa:
-                print("\n@@@ Nenhuma conta ativa! Crie uma nova conta primeiro. @@@")
+                print("\n@@@ Nenhuma conta ativa! Faça login em uma conta primeiro. @@@")
                 continue
             
             try:
                 valor = float(input("Informe o valor do saque: R$ "))
-                resultado = sacar(
-                    saldo=saldo,
-                    valor=valor,
-                    extrato=extrato,
-                    limite=limite,
-                    numero_saques=numero_saques,
-                    limite_saques=LIMITE_SAQUES,
-                    transacoes=transacoes,
-                    transacoes_hoje=transacoes_hoje
-                )
-                saldo, extrato, numero_saques, transacoes, transacoes_hoje = resultado
-                conta_ativa["transacoes"] = transacoes  # Atualizar transações da conta
+                sacar(conta_ativa['cpf'], conta_ativa['numero_conta'], valor, LIMITE, LIMITE_SAQUES)
             except ValueError:
                 print("\n@@@ Valor inválido! @@@")
         
         elif opcao == "ex":
-            exibir_extrato(saldo, extrato=extrato, transacoes=transacoes)
+            if not conta_ativa:
+                print("\n@@@ Nenhuma conta ativa! Faça login em uma conta primeiro. @@@")
+                continue
+            
+            exibir_extrato(conta_ativa['cpf'], conta_ativa['numero_conta'])
         
         elif opcao == "rel":
             if not conta_ativa:
-                print("\n@@@ Nenhuma conta ativa! Crie uma nova conta primeiro. @@@")
+                print("\n@@@ Nenhuma conta ativa! Faça login em uma conta primeiro. @@@")
                 continue
-            exibir_relatorio(conta_ativa)
-        
-        elif opcao == "it":
-            exibir_iterador_contas(contas)
+            
+            exibir_relatorio(conta_ativa['cpf'], conta_ativa['numero_conta'])
         
         elif opcao == "lc":
-            listar_contas(contas)
+            listar_contas()
         
         elif opcao == "lu":
-            listar_usuarios_com_contas(usuarios, contas)
+            listar_usuarios_com_contas()
+        
+        elif opcao == "it":
+            exibir_iterador_contas()
         
         elif opcao == "qt":
             print("\n" + "="*50)
